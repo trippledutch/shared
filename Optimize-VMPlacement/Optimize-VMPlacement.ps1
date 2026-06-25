@@ -1,88 +1,179 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    # The failover cluster to analyse.
-    [Parameter(Mandatory = $true)]
-    [string]$ClusterName,
+    # Cluster to analyse. Defaults to the local cluster when run on a node.
+    [string]$ClusterName = (Get-Cluster -ErrorAction SilentlyContinue).Name,
 
-    # Site -> node mapping. Drives the site-aware role-spread analysis.
-    # Example: @{ 'SiteA' = @('hv-a1','hv-a2'); 'SiteB' = @('hv-b1','hv-b2') }
+    # Site -> node mapping for the site-aware spread check. Empty = one site.
+    # Example: @{ 'SiteA' = 'hv01','hv02'; 'SiteB' = 'hv03','hv04' }
     [hashtable]$Sites = @{},
 
-    # VMs that do NOT support Live Migration. They may only be moved while
-    # powered OFF; this script never powers them off. A running, misaligned
-    # exception VM is reported as 'needs manual shutdown', not moved.
+    # VMs that cannot Live Migrate: only moved while Off, never powered off.
     [string[]]$NoLiveMigration = @(),
 
-    # VMs excluded from remediation (still LISTED in the report, just never moved).
+    # VMs never moved, but still listed in the report.
     [string[]]$ExcludeVMs = @(),
 
-    # Optional explicit role grouping: @{ 'DomainController' = 'DC*' }.
+    # Explicit role grouping: @{ 'DomainController' = 'DC*','*-DC' }.
     [hashtable]$RoleGroups = @{},
 
     [string]$OutputDir = 'C:\Temp',
 
-    # Skip the CSV-ownership rebalancing phase and use VM moves only.
-    [switch]$VMMovesOnly,
-
-    # Also write a graphical HTML report.
-    [switch]$Html,
-
-    # NOT default. Applies the remediation (honours -WhatIf).
-    [switch]$Balance,
+    [switch]$VMMovesOnly,   # skip Phase A (CSV-ownership); VM moves only
+    [switch]$Html,          # also write a graphical HTML report
+    [switch]$Balance,       # apply remediation (honours -WhatIf)
 
     [int]$SleepBetweenMigrationsSeconds = 30
 )
 
 <#
 .SYNOPSIS
-    Analyses and optionally rebalances VM placement on a Hyper-V failover
-    cluster: CSV-owner alignment and the site-aware spread of identical-
-    function VMs. Remediation prefers moving CSV OWNERSHIP (near-instant)
-    over moving VMs. Read-only unless -Balance.
+    Analyses - and optionally rebalances - VM placement on a Hyper-V
+    failover cluster: CSV-owner alignment, disks split across CSVs, and the
+    site-aware spread of identical-function VMs. Remediation prefers moving
+    CSV OWNERSHIP (near-instant) over moving VMs. Read-only unless -Balance.
 
 .DESCRIPTION
-    The read-only analysis always runs. With -Balance the script remediates
-    in three phases, honouring -WhatIf:
-      A. Move CSV ownership to the node where each CSV's VMs already run,
-         aligning many VMs without moving a single one.
-      B. Live Migrate the running remainder to their CSV owner. Powered-off
-         VMs are named but skipped; a running no-LM VM is reported as
-         'needs manual shutdown'. THE SCRIPT NEVER POWERS A VM OFF.
-      C. Set anti-affinity on spreadable role groups (site-aware).
-    Output: a per-node PRE/POST view as ASCII bars, plus .txt and .csv (and
-    .html with -Html) in -OutputDir. Always preview with -WhatIf first.
+    PART 1 - ANALYSIS (always, read-only)
+      1. CSV-owner alignment: each VHD is mapped to its CSV (strict mount
+         prefix match), sized with Get-VHD FileSize; the PRIMARY CSV (most
+         bytes) and its owner node are compared with the node the VM runs on.
+      2. Split disks: VMs whose disks span multiple CSVs are reported.
+      3. Identical-function spread: VMs are grouped by role key; the spread
+         is checked PER SITE (a role's members can only realistically run on
+         the nodes of the site(s) they belong to). A role is 'spreadable'
+         when its member count <= the usable node count of those sites; a
+         larger group is a 'pool' and is reported with its imbalance.
+      4. Excluded / out-of-scope VMs (e.g. -ExcludeVMs, non-clustered VMs)
+         are LISTED so nothing is silently dropped, but are never moved.
 
-    Built on Darryl van der Peijl's original "align VMs with storage" idea
-    (https://www.darrylvanderpeijl.com/align-vms-with-storage/), extended
-    with CSV-ownership-first remediation, site-aware role spread and a
-    measured before/after.
+    PART 2 - REMEDIATION (-Balance only; honours -WhatIf)
+      Phase A - CSV-ownership rebalancing (primary, low-disruption):
+        For each CSV the script finds the node where most of that CSV's VMs
+        already run and, if that is not the current owner, moves the CSV
+        ownership there (Move-ClusterSharedVolume). This re-aligns many VMs
+        at once WITHOUT moving a single VM, and does not change the VM count
+        or memory per node. Skipped with -VMMovesOnly.
+      Phase B - VM moves (fallback for the remainder):
+        VMs still misaligned after Phase A are moved to their CSV owner.
+        Live Migration when supported; offline ownership move when the VM is
+        Off; a running -NoLiveMigration VM is reported as 'needs manual
+        shutdown'. THE SCRIPT NEVER POWERS A VM OFF.
+      Phase C - Anti-affinity:
+        For every spreadable role group a shared AntiAffinityClassNames is
+        set so the cluster keeps the members apart on future placement.
+
+    OUTPUT
+      A PRE and a POST situation per node (VM count, assigned memory,
+      aligned/misaligned, role collisions) as ASCII bars, with an
+      intermediate 'after CSV-ownership' alignment figure. Files in
+      -OutputDir: .txt (full report, UTF-8 BOM), .csv (per-VM model),
+      and .html (graphical, with -Html).
+
+.PARAMETER ClusterName       Cluster to analyse. Defaults to the local cluster.
+.PARAMETER Sites             Hashtable site -> node names (site-aware spread). Empty = one site.
+.PARAMETER NoLiveMigration   VMs only movable while Off; never powered off.
+.PARAMETER ExcludeVMs        VMs never moved, but still listed in the report.
+.PARAMETER RoleGroups        Explicit role -> name-pattern(s) grouping.
+.PARAMETER VMMovesOnly       Skip CSV-ownership rebalancing (Phase A).
+.PARAMETER Balance           Apply the remediation. Combine with -WhatIf.
+.PARAMETER Html              Also emit a graphical HTML report.
+.PARAMETER WhatIf            Preview all moves/ownership/anti-affinity changes.
 
 .EXAMPLE
-    .\Optimize-VMPlacement.ps1 -ClusterName CLUSTER01
+    .\Optimize-VMPlacement.ps1
     Analysis only; prints findings and the projected Post situation.
 
 .EXAMPLE
-    .\Optimize-VMPlacement.ps1 -ClusterName CLUSTER01 -Balance -WhatIf
-    Previews every ownership move, VM move and anti-affinity change without
-    touching the cluster. Run this first.
+    .\Optimize-VMPlacement.ps1 -ClusterName HVCLUSTER -Sites @{ 'A'='hv01','hv02'; 'B'='hv03','hv04' }
+    Site-aware analysis of a named cluster.
+
+.EXAMPLE
+    .\Optimize-VMPlacement.ps1 -Balance -WhatIf
+    Shows the CSV-ownership moves, the remaining VM moves and the
+    anti-affinity changes, without touching the cluster. Run this first.
 
 .NOTES
-    Author   : Hans Vredevoort - CloudLabs (https://cldlbs.com)
-    Credit   : Darryl van der Peijl - original align-VMs-with-storage idea
-    Licence  : MIT
-    Requires : Windows PowerShell 5.1 or PowerShell 7+, FailoverClusters and
-               Hyper-V modules, WinRM and local admin on the nodes, and
-               Cluster Full Control for -Balance.
-    Read-only: YES, unless -Balance is supplied.
+    Script Name : Optimize-VMPlacement.ps1
+    Author      : Hans Vredevoort - CloudLabs
+    Version     : 0.9
+    Run from    : a cluster node or a management host with the FailoverClusters
+                  and Hyper-V modules and WinRM to the nodes.
+    Requires    : Windows PowerShell 5.1 or PowerShell 7+
+                  Cluster Full Control (only for -Balance)
+                  Local admin on the nodes (Get-VM / Get-VHD remoting)
+    Read-only   : YES, unless -Balance is supplied.
+
+.CHANGELOG
+    v0.9 (25 June 2026)
+      - Header now prints the configured -Sites (site -> node mapping) so the
+        site-aware analysis is transparent about which nodes belong to which site.
+    v0.8 (25 June 2026)
+      - Off-VM quick-migration is now SPREAD-AWARE: a powered-off VM is moved to
+        its CSV owner only when the move does not worsen its role spread (an off
+        VM gains nothing from alignment until it runs, so resilience is never
+        traded for it). The decision is greedy, so several off VMs of one role
+        split across nodes instead of re-colliding on the target. VMs that would
+        add a collision are HELD (OffHeld) and align by themselves on a later run.
+    v0.7 (25 June 2026)
+      - Powered-off, misaligned VMs are now QUICK-MIGRATED to their CSV owner
+        under -Balance (offline cluster move, no downtime, no Live Migration)
+        instead of being skipped. POST and the execution summary count them as
+        aligned (OffMigrated), so the off-VM figure goes to 0.
+      - Anti-affinity is now IDEMPOTENT: the current AntiAffinityClassNames is
+        read first and the class is only SET where missing. A second run reports
+        'already set' instead of re-applying it on every member.
+      - RECOMMENDATIONS Phase A line reads correctly when 0 CSV moves are needed
+        ('already optimal') instead of 'apply the 0 move(s)'.
+      - Running the script with NO parameters prints a parameter-options summary.
+      - PRE/POST shows 'Aligned' and 'Misaligned' as two full-title columns.
+    v0.6 (20 June 2026)
+      - Powered-off VMs no longer count as 'Misaligned'. They split into a
+        separate, neutral 'Off, alignable risk-free' line (an off VM can be
+        quick/storage-migrated to its CSV owner with no downtime, so it is not
+        a live risk). Running misaligned VMs are the only ones flagged red.
+      - Per-node PRE/POST rows go red only on RUNNING misaligned VMs.
+      - Role spread: a pool already at its best balance (imbalance 0) is now
+        Green, not Red - there is nothing to act on. Red is reserved for
+        spreadable collisions and pools off their balance.
+    v0.5 (18 June 2026)
+      - Console/log colours reduced to White (info), Green (aligned / OK /
+        non-disruptive win / apply commands) and Red (misaligned /
+        collisions / moves needing attention / failures) for readability on
+        a blue or black console.
+      - Recommendations now NAME the skipped powered-off VMs.
+      - Excluded VMs are labelled 'Planned exclusion' in the out-of-scope
+        list (instead of 'in -ExcludeVMs').
+    v0.4 (18 June 2026)
+      - CHANGED Phase B: powered-off VMs are now NAMED but SKIPPED (their
+        alignment only matters when running); only running VMs are moved.
+      - NEW: the log ends with a RECOMMENDATIONS block plus the exact
+        -WhatIf preview and -Balance apply commands.
+    v0.3 (18 June 2026)
+      - NEW remediation strategy: Phase A rebalances CSV OWNERSHIP
+        (Move-ClusterSharedVolume) to where each CSV's VMs already run,
+        re-aligning many VMs with no VM moves; VM moves (Phase B) handle
+        only the remainder. -VMMovesOnly forces the old VM-only behaviour.
+      - CHANGED role spread to be SITE-AWARE: the spreadable threshold and
+        anti-affinity now use the usable node count of the role's site(s),
+        not the whole cluster, so site-bound pools (e.g. RDP/TS) are no
+        longer flagged as fully spreadable.
+      - NEW: excluded and non-clustered (out-of-scope) VMs are listed in the
+        report instead of being silently dropped.
+    v0.2 (18 June 2026)
+      - Lint fixes; expanded help.
+    v0.1 (18 June 2026)
+      - Initial release.
 #>
 
 # ----- Encoding + output -----
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+if (-not $ClusterName) { throw "No cluster found. Run on a cluster node or pass -ClusterName." }
 if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+$filePrefix = ($ClusterName -replace '[^A-Za-z0-9._-]', '_')
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmm'
-$logFile   = Join-Path $OutputDir ("VMPlacement_{0}.txt"  -f $timestamp)
-$htmlFile  = Join-Path $OutputDir ("VMPlacement_{0}.html" -f $timestamp)
-$csvFile   = Join-Path $OutputDir ("VMPlacement_{0}.csv"  -f $timestamp)
+$logFile   = Join-Path $OutputDir ("{0}_VMPlacement_{1}.txt"  -f $filePrefix, $timestamp)
+$htmlFile  = Join-Path $OutputDir ("{0}_VMPlacement_{1}.html" -f $filePrefix, $timestamp)
+$csvFile   = Join-Path $OutputDir ("{0}_VMPlacement_{1}.csv"  -f $filePrefix, $timestamp)
 
 $script:sb = New-Object System.Text.StringBuilder
 function Write-Log {
@@ -111,13 +202,32 @@ function Get-RoleKey {
     return $n
 }
 
-Write-Log ("Optimize-VMPlacement") -Color White
+Write-Log ("Optimize-VMPlacement v0.9") -Color White
 Write-Log ("Run at {0} on {1}" -f (Get-Date), $env:COMPUTERNAME) -Color White
 Write-Log ("Cluster         : {0}" -f $ClusterName) -Color White
 Write-Log ("Mode            : {0}" -f $(if ($Balance) { 'BALANCE (remediation)' } else { 'ANALYSIS ONLY (read-only)' })) -Color White
 Write-Log ("CSV-owner phase : {0}" -f $(if ($VMMovesOnly) { 'OFF (-VMMovesOnly)' } else { 'ON (primary)' })) -Color White
+$siteKeys = @($Sites.Keys | Sort-Object)
+for ($si = 0; $si -lt $siteKeys.Count; $si++) {
+    $lbl = if ($si -eq 0) { 'Sites           : ' } else { '                  ' }
+    Write-Log ("{0}{1,-12}{2}" -f $lbl, $siteKeys[$si], ($Sites[$siteKeys[$si]] -join ', ')) -Color White
+}
 Write-Log ("No-LiveMigration: {0}" -f ($NoLiveMigration -join ', ')) -Color White
 Write-Log ("Excluded        : {0}" -f ($ExcludeVMs -join ', ')) -Color White
+if ($PSBoundParameters.Count -eq 0) {
+    Write-Log ''
+    Write-Log '--- Parameter options (running bare = analysis only; add -Balance to act) ---' -Color White
+    Write-Log ("  -ClusterName <name>       cluster to analyse                 (default: {0})" -f $ClusterName)
+    Write-Log ("  -ExcludeVMs <names>       never moved, still reported        (default: {0})" -f ($ExcludeVMs -join ', '))
+    Write-Log ("  -NoLiveMigration <names>  only moved while off                (default: {0})" -f ($NoLiveMigration -join ', '))
+    Write-Log  "  -Sites <hashtable>        site -> node mapping (site-aware spread)"
+    Write-Log  "  -RoleGroups <hashtable>   explicit role grouping override"
+    Write-Log  "  -VMMovesOnly              skip Phase A (CSV-ownership); use VM moves only"
+    Write-Log ("  -OutputDir <path>         .txt/.csv/.html output folder       (default: {0})" -f $OutputDir)
+    Write-Log  "  -Html                     also write a graphical HTML report"
+    Write-Log  "  -Balance                  APPLY remediation (combine with -WhatIf to preview)"
+    Write-Log  "  -WhatIf                   preview every change without touching the cluster"
+}
 Write-Log ''
 
 # ----- Node + site model -----
@@ -277,7 +387,7 @@ foreach ($vm in $inScope) {
 function Get-Distribution {
     param([hashtable]$Placement, [hashtable]$AlignOwner)
     $dist = [ordered]@{}
-    foreach ($nk in $nodeKeys) { $dist[$nk] = [pscustomobject]@{ VMs = 0; Running = 0; MemGB = 0.0; Aligned = 0; Misaligned = 0 } }
+    foreach ($nk in $nodeKeys) { $dist[$nk] = [pscustomobject]@{ VMs = 0; Running = 0; MemGB = 0.0; Aligned = 0; Misaligned = 0; MisalignedRunning = 0 } }
     foreach ($vm in $inScope) {
         $node = $(if ($Placement.ContainsKey($vm.Name)) { $Placement[$vm.Name] } else { $vm.OwnerNode })
         if (-not $dist.Contains($node)) { continue }
@@ -285,7 +395,12 @@ function Get-Distribution {
         if ($vm.State -eq 'Running') { $dist[$node].Running++ }
         $dist[$node].MemGB += $vm.MemoryGB
         $owner = $(if ($AlignOwner.ContainsKey($vm.Name)) { $AlignOwner[$vm.Name] } else { $null })
-        if ($null -ne $owner -and $node -eq $owner) { $dist[$node].Aligned++ } else { $dist[$node].Misaligned++ }
+        if ($null -ne $owner -and $node -eq $owner) {
+            $dist[$node].Aligned++
+        } else {
+            $dist[$node].Misaligned++
+            if ($vm.State -eq 'Running') { $dist[$node].MisalignedRunning++ }
+        }
     }
     return $dist
 }
@@ -328,6 +443,19 @@ function Get-RoleSpread {
     return [pscustomobject]@{ Total = $total; PoolImbalance = $poolImb; Detail = $detail }
 }
 
+function Get-RoleBadness {
+    # Spread penalty for a role: collisions if spreadable, else pool imbalance.
+    param([hashtable]$PerNode, [int]$MemberCount, [int]$Avail)
+    if ($Avail -lt 1) { $Avail = 1 }
+    if ($MemberCount -le $Avail) {
+        $b = 0; foreach ($c in $PerNode.Values) { if ($c -gt 1) { $b += ($c - 1) } }
+        return $b
+    }
+    $ceil = [math]::Ceiling($MemberCount / $Avail)
+    $b = 0; foreach ($c in $PerNode.Values) { if ($c -gt $ceil) { $b += ($c - $ceil) } }
+    return $b
+}
+
 # Alignment-owner maps
 $preAlign  = @{}; foreach ($vm in $inScope) { $preAlign[$vm.Name]  = $vm.PrimaryOwner }
 $postAlign = @{}; foreach ($vm in $inScope) { $postAlign[$vm.Name] = $vm.PostPrimaryOwner }
@@ -340,7 +468,11 @@ Write-Log ''
 Write-Log '########## ANALYSIS ##########' -Color White
 $alignedNow   = @($inScope | Where-Object Aligned).Count
 $alignedPhaseA = @($inScope | Where-Object { $null -ne $_.PostPrimaryOwner -and $_.OwnerNode -eq $_.PostPrimaryOwner }).Count
-$misaligned   = @($inScope | Where-Object { -not $_.Aligned -and $null -ne $_.PrimaryOwner })
+$misaligned    = @($inScope | Where-Object { -not $_.Aligned -and $null -ne $_.PrimaryOwner })
+# A powered-off VM is not a live risk: it can be quick/storage-migrated to its CSV
+# owner with no downtime. So it does NOT count as "misaligned" - only running VMs do.
+$misalignedRun = @($misaligned | Where-Object { $_.State -eq 'Running' })
+$misalignedOff = @($misaligned | Where-Object { $_.State -ne 'Running' })
 $split        = @($inScope | Where-Object SplitCsv)
 $noCsv        = @($inScope | Where-Object { $null -eq $_.PrimaryOwner })
 
@@ -349,18 +481,33 @@ Write-Log "--- CSV alignment (VM runs on the owner of its primary CSV) ---" -Col
 Write-Log ("In-scope clustered VMs       : {0}" -f $inScope.Count)
 Write-Log ("Aligned now                  : {0}" -f $alignedNow) -Color Green
 Write-Log ("Aligned after CSV-owner phase : {0}  (no VM moves)" -f $alignedPhaseA) -Color Green
-Write-Log ("Misaligned now               : {0}" -f $misaligned.Count) -Color Red
+$runCol = if ($misalignedRun.Count -gt 0) { 'Red' } else { 'Green' }
+Write-Log ("Misaligned (running)         : {0}" -f $misalignedRun.Count) -Color $runCol
+if ($misalignedOff.Count -gt 0) {
+    Write-Log ("Off, alignable risk-free     : {0}  (quick-migrate when convenient)" -f $misalignedOff.Count) -Color White
+}
 Write-Log ("Disks split over CSVs        : {0}" -f $split.Count)
 Write-Log ("No CSV match for disks       : {0}" -f $noCsv.Count)
 Write-Log ''
-if ($misaligned.Count -gt 0) {
+if ($misalignedRun.Count -gt 0) {
+    Write-Log "Misaligned and RUNNING (move to CSV owner):" -Color Red
     Write-Log ("{0,-26} {1,-9} {2,-9} {3,-12} {4}" -f 'VM', 'Runs on', 'CSV owner', 'PrimaryCSV', 'Note') -Color White
-    foreach ($vm in ($misaligned | Sort-Object Name)) {
+    foreach ($vm in ($misalignedRun | Sort-Object Name)) {
         $note = @()
         if ($vm.SplitCsv) { $note += ("split: " + $vm.CsvBreakdown) }
         if ($vm.NoLM)     { $note += 'no-LM' }
-        if ($vm.State -ne 'Running') { $note += $vm.State }
-        Write-Log ("{0,-26} {1,-9} {2,-9} {3,-12} {4}" -f $vm.Name, $vm.OwnerNode.ToUpper(), $vm.PrimaryOwner.ToUpper(), $vm.PrimaryCsv, ($note -join '; '))
+        Write-Log ("{0,-26} {1,-9} {2,-9} {3,-12} {4}" -f $vm.Name, $vm.OwnerNode.ToUpper(), $vm.PrimaryOwner.ToUpper(), $vm.PrimaryCsv, ($note -join '; ')) -Color Red
+    }
+    Write-Log ''
+}
+if ($misalignedOff.Count -gt 0) {
+    Write-Log "Powered off, not yet aligned (quick-migrate risk-free; no downtime):" -Color White
+    Write-Log ("{0,-26} {1,-9} {2,-9} {3,-12} {4}" -f 'VM', 'Runs on', 'CSV owner', 'PrimaryCSV', 'Note') -Color White
+    foreach ($vm in ($misalignedOff | Sort-Object Name)) {
+        $note = @('Off')
+        if ($vm.SplitCsv) { $note += ("split: " + $vm.CsvBreakdown) }
+        if ($vm.NoLM)     { $note += 'no-LM' }
+        Write-Log ("{0,-26} {1,-9} {2,-9} {3,-12} {4}" -f $vm.Name, $vm.OwnerNode.ToUpper(), $vm.PrimaryOwner.ToUpper(), $vm.PrimaryCsv, ($note -join '; ')) -Color White
     }
 }
 if ($split.Count -gt 0) {
@@ -378,8 +525,10 @@ Write-Log ("Pool imbalance (>site nodes)  : {0}" -f $preColl.PoolImbalance)
 Write-Log ''
 Write-Log ("{0,-22} {1,-5} {2,-5} {3,-10} {4}" -f 'Role', 'Cnt', 'Site', 'Collisions', 'Per-node layout') -Color White
 foreach ($d in ($preColl.Detail | Sort-Object @{E={$_.Collisions};Descending=$true}, Role)) {
-    $col = if (($d.Collisions -gt 0) -or (-not $d.Spreadable -and $d.Imbalance -gt 0)) { 'Red' } else { 'Green' }
-    $tag = if (-not $d.Spreadable) { (" (pool > {0} site nodes, imbalance {1})" -f $d.Avail, $d.Imbalance) } else { '' }
+    # Red only when actionable: a spreadable collision, or a pool off its balance.
+    $actionable = ($d.Spreadable -and $d.Collisions -gt 0) -or ((-not $d.Spreadable) -and $d.Imbalance -gt 0)
+    $col = if ($actionable) { 'Red' } else { 'Green' }
+    $tag = if (-not $d.Spreadable) { (" (pool > {0} site nodes, imbalance {1}{2})" -f $d.Avail, $d.Imbalance, $(if ($d.Imbalance -eq 0) { ' - optimal' } else { '' })) } else { '' }
     Write-Log ("{0,-22} {1,-5} {2,-5} {3,-10} {4}{5}" -f $d.Role, $d.Count, $d.Avail, $d.Collisions, $d.Layout, $tag) -Color $col
 }
 
@@ -400,32 +549,56 @@ if ($outScope.Count -gt 0) {
 # PART 2 - REMEDIATION PLAN
 # =====================================================================
 # Phase B: VMs still misaligned after the CSV-ownership phase.
-# v0.4: powered-off VMs are named but SKIPPED (alignment only matters while
-# running). Only running VMs are moved (Live, or manual shutdown for no-LM).
 $planVM = foreach ($vm in ($inScope | Where-Object { $null -ne $_.PostPrimaryOwner -and $_.OwnerNode -ne $_.PostPrimaryOwner } | Sort-Object Name)) {
     $target = $vm.PostPrimaryOwner
     $targetUsable = ($nodeMeta.Contains($target) -and $nodeMeta[$target].Usable)
     $method = $null; $note = ''
     if (-not $targetUsable) { $method = 'Skip'; $note = "target $($target.ToUpper()) not usable" }
-    elseif ($vm.State -ne 'Running') { $method = 'OffSkipped'; $note = 'powered off; align on a later run when running' }
+    elseif ($vm.State -ne 'Running') { $method = 'OffCandidate'; $note = '' }
     elseif ($vm.NoLM) { $method = 'ManualShutdown'; $note = 'no-LM VM is running; power off manually, then re-run' }
     else { $method = 'Live' }
     [pscustomobject]@{ VM = $vm.Name; From = $vm.OwnerNode; To = $target; Method = $method; Split = $vm.SplitCsv; Note = $note }
 }
 $planVM = @($planVM)
-$offSkip = @($planVM | Where-Object Method -eq 'OffSkipped')
 
-# Projected POST placement (only running Live moves change placement;
-# Phase A re-owns CSVs without moving VMs; OFF VMs are left in place)
+# An off VM is quick-migrated to its CSV owner only when the move does not worsen its
+# role spread (greedy against current owners + Live moves); otherwise it is held.
+$roleInfo = @{}; foreach ($d in $preColl.Detail) { $roleInfo[$d.Role] = $d }
+$vmRole   = @{}; foreach ($vm in $inScope) { $vmRole[$vm.Name] = $vm.RoleKey }
+$proj     = @{}; foreach ($vm in $inScope) { $proj[$vm.Name] = $vm.OwnerNode }
+foreach ($p in $planVM) { if ($p.Method -eq 'Live') { $proj[$p.VM] = $p.To } }
+foreach ($p in ($planVM | Where-Object Method -eq 'OffCandidate' | Sort-Object VM)) {
+    $info = $roleInfo[$vmRole[$p.VM]]
+    if ($null -eq $info) { $p.Method = 'OffMigrate'; $p.Note = 'powered off; quick-migrate to CSV owner (no downtime)'; $proj[$p.VM] = $p.To; continue }
+    $before = @{}; foreach ($m in $info.Members) { $nd = $proj[$m]; if ($nd) { $before[$nd] = 1 + $(if ($before.ContainsKey($nd)) { $before[$nd] } else { 0 }) } }
+    $bBefore = Get-RoleBadness -PerNode $before -MemberCount $info.Count -Avail $info.Avail
+    $after = @{}; foreach ($k in $before.Keys) { $after[$k] = $before[$k] }
+    $fromN = $proj[$p.VM]; $toN = $p.To
+    if ($after.ContainsKey($fromN)) { $after[$fromN]-- ; if ($after[$fromN] -le 0) { $after.Remove($fromN) } }
+    $after[$toN] = 1 + $(if ($after.ContainsKey($toN)) { $after[$toN] } else { 0 })
+    $bAfter = Get-RoleBadness -PerNode $after -MemberCount $info.Count -Avail $info.Avail
+    if ($bAfter -le $bBefore) { $p.Method = 'OffMigrate'; $p.Note = 'powered off; quick-migrate to CSV owner (no downtime)'; $proj[$p.VM] = $p.To }
+    else { $p.Method = 'OffHold'; $p.Note = 'powered off; held to protect role spread (move would add a collision)' }
+}
+$offMove = @($planVM | Where-Object Method -eq 'OffMigrate')
+$offHold = @($planVM | Where-Object Method -eq 'OffHold')
+
+# Projected POST placement: running Live moves AND the accepted off-VM quick-migrations
+# change placement (Phase A re-owns CSVs without moving VMs; held off VMs stay put).
 $postPlacement = @{}
 foreach ($vm in $inScope) { $postPlacement[$vm.Name] = $vm.OwnerNode }
-foreach ($p in $planVM) { if ($p.Method -eq 'Live') { $postPlacement[$p.VM] = $p.To } }
+foreach ($p in $planVM) { if ($p.Method -in 'Live', 'OffMigrate') { $postPlacement[$p.VM] = $p.To } }
 
-# Anti-affinity for spreadable role groups
+# Anti-affinity for spreadable role groups, idempotent: read current state, set only where missing.
+$aaCurrent = @{}
+try { foreach ($g in (Get-ClusterGroup -Cluster $ClusterName -ErrorAction Stop)) { $aaCurrent[$g.Name] = @($g.AntiAffinityClassNames) } } catch { }
 $aaPlan = foreach ($d in ($preColl.Detail | Where-Object Spreadable)) {
-    [pscustomobject]@{ Role = $d.Role; Class = ("Role-" + ($d.Role -replace '[^A-Za-z0-9]', '')); Members = $d.Members; Count = $d.Count }
+    $class = "Role-" + ($d.Role -replace '[^A-Za-z0-9]', '')
+    $toSet = @($d.Members | Where-Object { ($aaCurrent[$_]) -notcontains $class })
+    [pscustomobject]@{ Role = $d.Role; Class = $class; Members = $d.Members; Count = $d.Count; ToSet = $toSet; AlreadySet = ($d.Count - $toSet.Count) }
 }
 $aaPlan = @($aaPlan)
+$aaToSetTotal = (@($aaPlan) | ForEach-Object { $_.ToSet.Count } | Measure-Object -Sum).Sum
 
 Write-Log ''
 Write-Log '########## REMEDIATION PLAN ##########' -Color White
@@ -443,13 +616,26 @@ foreach ($p in $runMoves) {
     Write-Log ("{0,-26} {1,-8} -> {2,-8} [{3}] {4}" -f $p.VM, $p.From.ToUpper(), $p.To.ToUpper(), $p.Method, $p.Note) -Color Red
 }
 Write-Log ''
-Write-Log ("--- Phase B: powered-off VMs SKIPPED ({0}) - named, not moved (align on a later run when running) ---" -f $offSkip.Count) -Color White
-foreach ($p in ($offSkip | Sort-Object VM)) {
-    Write-Log ("{0,-26} {1,-8} (would align to {2})" -f $p.VM, $p.From.ToUpper(), $p.To.ToUpper()) -Color White
+Write-Log ("--- Phase B: powered-off VMs quick-migrated to their CSV owner ({0}) - no downtime, spread-safe ---" -f $offMove.Count) -Color White
+foreach ($p in ($offMove | Sort-Object VM)) {
+    Write-Log ("{0,-26} {1,-8} -> {2,-8} (quick-migrate, off)" -f $p.VM, $p.From.ToUpper(), $p.To.ToUpper()) -Color Green
+}
+if ($offHold.Count -gt 0) {
+    Write-Log ''
+    Write-Log ("--- Phase B: powered-off VMs HELD in place to protect role spread ({0}) ---" -f $offHold.Count) -Color White
+    foreach ($p in ($offHold | Sort-Object VM)) {
+        Write-Log ("{0,-26} {1,-8} (CSV owner {2}; moving there would add a role collision - left off, aligns when running)" -f $p.VM, $p.From.ToUpper(), $p.To.ToUpper()) -Color White
+    }
 }
 Write-Log ''
-Write-Log ("--- Phase C: anti-affinity for spreadable role groups ({0}) ---" -f $aaPlan.Count) -Color White
-foreach ($a in ($aaPlan | Sort-Object Role)) { Write-Log ("{0,-22} class '{1}'  ({2}: {3})" -f $a.Role, $a.Class, $a.Count, ($a.Members -join ', ')) }
+Write-Log ("--- Phase C: anti-affinity for spreadable role groups ({0} group(s); {1} member(s) still to set) ---" -f $aaPlan.Count, $aaToSetTotal) -Color White
+foreach ($a in ($aaPlan | Sort-Object Role)) {
+    if ($a.ToSet.Count -eq 0) {
+        Write-Log ("{0,-22} class '{1}'  (already set on all {2}; no change)" -f $a.Role, $a.Class, $a.Count) -Color Green
+    } else {
+        Write-Log ("{0,-22} class '{1}'  (set {2} of {3}; {4} already set)" -f $a.Role, $a.Class, $a.ToSet.Count, $a.Count, $a.AlreadySet)
+    }
+}
 $pools = @($preColl.Detail | Where-Object { -not $_.Spreadable })
 if ($pools.Count -gt 0) {
     Write-Log ''
@@ -475,11 +661,11 @@ function Show-DistBlock {
     param([string]$Title, $Dist, [object]$Coll)
     Write-Log ''
     Write-Log ("=== {0} ===" -f $Title) -Color White
-    Write-Log ("{0,-10} {1,-5} {2,-26} {3,-7} {4}" -f 'Node', 'VMs', 'VM count', 'Mem GB', 'Aln/Mis') -Color White
+    Write-Log ("{0,-10} {1,-5} {2,-26} {3,-7} {4,-9} {5}" -f 'Node', 'VMs', 'VM count', 'Mem GB', 'Aligned', 'Misaligned') -Color White
     foreach ($nk in $nodeKeys) {
         $d = $Dist[$nk]
-        $rowCol = if ($d.Misaligned -eq 0) { 'Green' } else { 'Red' }
-        Write-Log ("{0,-10} {1,-5} {2,-26} {3,-7} {4}/{5}" -f $nodeMeta[$nk].Name.ToUpper(), $d.VMs, (Get-Bar -Value $d.VMs -Max $maxVMs), [math]::Round($d.MemGB, 0), $d.Aligned, $d.Misaligned) -Color $rowCol
+        $rowCol = if ($d.MisalignedRunning -eq 0) { 'Green' } else { 'Red' }
+        Write-Log ("{0,-10} {1,-5} {2,-26} {3,-7} {4,-9} {5}" -f $nodeMeta[$nk].Name.ToUpper(), $d.VMs, (Get-Bar -Value $d.VMs -Max $maxVMs), [math]::Round($d.MemGB, 0), $d.Aligned, $d.Misaligned) -Color $rowCol
     }
     $a = (($Dist.Values | Measure-Object Aligned -Sum).Sum)
     $sumCol = if ($a -eq $inScope.Count -and $Coll.Total -eq 0) { 'Green' } else { 'White' }
@@ -489,14 +675,17 @@ Write-Log ''
 Write-Log '########## PRE / POST (projected) ##########' -Color White
 Show-DistBlock -Title 'PRE  (current)'   -Dist $preDist  -Coll $preColl
 Show-DistBlock -Title 'POST (projected)' -Dist $postDist -Coll $postColl
-if ($offSkip.Count -gt 0) {
-    Write-Log ("Note: {0} powered-off VM(s) remain misaligned by design (skipped); align them on a later run when they are running." -f $offSkip.Count) -Color White
+if ($offMove.Count -gt 0) {
+    Write-Log ("Note: {0} powered-off VM(s) are quick-migrated to their CSV owner under -Balance (no downtime, no Live Migration); POST already counts them as aligned." -f $offMove.Count) -Color White
+}
+if ($offHold.Count -gt 0) {
+    Write-Log ("Note: {0} powered-off VM(s) are held in place because the alignment move would worsen role spread; they align by themselves on a later run once running. Role spread is never traded for off-VM alignment." -f $offHold.Count) -Color White
 }
 
 # =====================================================================
 # EXECUTION (-Balance; honours -WhatIf)
 # =====================================================================
-$exec = [ordered]@{ CsvOwnerMoved = 0; VMMovedLive = 0; OffSkipped = 0; ManualShutdown = 0; Skipped = 0; Failed = 0; AntiAffinitySet = 0 }
+$exec = [ordered]@{ CsvOwnerMoved = 0; VMMovedLive = 0; OffMigrated = 0; OffHeld = 0; ManualShutdown = 0; Skipped = 0; Failed = 0; AntiAffinitySet = 0; AntiAffinityAlready = 0 }
 if ($Balance) {
     Write-Log ''
     Write-Log '########## APPLYING REMEDIATION ##########' -Color White
@@ -510,9 +699,18 @@ if ($Balance) {
     }
     # Phase B (running VMs only; OFF VMs are named-but-skipped)
     foreach ($p in $planVM) {
-        if ($p.Method -eq 'OffSkipped')     { $exec.OffSkipped++; continue }
+        if ($p.Method -eq 'OffHold')        { $exec.OffHeld++; continue }
         if ($p.Method -eq 'ManualShutdown') { Write-Log ("MANUAL {0}: {1}" -f $p.VM, $p.Note) -Color Red; $exec.ManualShutdown++; continue }
         if ($p.Method -eq 'Skip')           { Write-Log ("SKIP   {0}: {1}" -f $p.VM, $p.Note) -Color Red; $exec.Skipped++; continue }
+        if ($p.Method -eq 'OffMigrate') {
+            if ($PSCmdlet.ShouldProcess($p.VM, ("Quick-migrate (off) {0} -> {1}" -f $p.From.ToUpper(), $p.To.ToUpper()))) {
+                try {
+                    Move-ClusterVirtualMachineRole -Cluster $ClusterName -Name $p.VM -Node $p.To -ErrorAction Stop | Out-Null; $exec.OffMigrated++
+                    Write-Log ("MOVED  {0} -> {1} (off, quick)" -f $p.VM, $p.To.ToUpper()) -Color Green
+                } catch { Write-Log ("FAIL   {0}: {1}" -f $p.VM, $_.Exception.Message) -Color Red; $exec.Failed++ }
+            }
+            continue
+        }
         if ($PSCmdlet.ShouldProcess($p.VM, ("Live-migrate {0} -> {1}" -f $p.From.ToUpper(), $p.To.ToUpper()))) {
             try {
                 Move-ClusterVirtualMachineRole -Cluster $ClusterName -Name $p.VM -Node $p.To -MigrationType Live -ErrorAction Stop | Out-Null; $exec.VMMovedLive++
@@ -521,14 +719,16 @@ if ($Balance) {
             } catch { Write-Log ("FAIL   {0}: {1}" -f $p.VM, $_.Exception.Message) -Color Red; $exec.Failed++ }
         }
     }
-    # Phase C
+    # Phase C (idempotent: only set where the class is missing)
     foreach ($a in $aaPlan) {
-        if ($PSCmdlet.ShouldProcess($a.Role, ("Set AntiAffinityClassNames '{0}' on {1} VMs" -f $a.Class, $a.Count))) {
-            foreach ($m in $a.Members) {
+        $exec.AntiAffinityAlready += $a.AlreadySet
+        if ($a.ToSet.Count -eq 0) { continue }
+        if ($PSCmdlet.ShouldProcess($a.Role, ("Set AntiAffinityClassNames '{0}' on {1} VM(s)" -f $a.Class, $a.ToSet.Count))) {
+            foreach ($m in $a.ToSet) {
                 try { $g = Get-ClusterGroup -Cluster $ClusterName -Name $m -ErrorAction Stop; $g.AntiAffinityClassNames = @($a.Class); $exec.AntiAffinitySet++ }
                 catch { Write-Log ("FAIL   anti-affinity on {0}: {1}" -f $m, $_.Exception.Message) -Color Red }
             }
-            Write-Log ("AA     {0}: class '{1}' on {2} members" -f $a.Role, $a.Class, $a.Count) -Color Green
+            Write-Log ("AA     {0}: class '{1}' set on {2} member(s)" -f $a.Role, $a.Class, $a.ToSet.Count) -Color Green
         }
     }
     Write-Log ''
@@ -549,19 +749,29 @@ $manualN = @($planVM | Where-Object Method -eq 'ManualShutdown').Count
 Write-Log ''
 Write-Log '########## RECOMMENDATIONS ##########' -Color White
 Write-Log ''
-Write-Log ("1. Phase A (main action): apply the {0} CSV-ownership move(s). This re-aligns {1} -> {2} VMs with NO VM moves and is non-disruptive on a SAN cluster (only the CSV coordinator node changes)." -f $csvOwnerPlan.Count, $alignedNow, $alignedPhaseA)
+if ($csvOwnerPlan.Count -eq 0) {
+    Write-Log "1. Phase A (main action): no CSV-ownership moves needed - CSV alignment is already optimal."
+} else {
+    Write-Log ("1. Phase A (main action): apply the {0} CSV-ownership move(s). This re-aligns {1} -> {2} VMs with NO VM moves and is non-disruptive on a SAN cluster (only the CSV coordinator node changes)." -f $csvOwnerPlan.Count, $alignedNow, $alignedPhaseA)
+}
 if ($liveN -gt 0 -or $manualN -gt 0) {
-    Write-Log ("2. Phase B: {0} running VM(s) need a Live Migration{1}. Verify any appliance or Linux VM (e.g. an appliance or Linux VM) with a single test Live Migration before applying in bulk." -f $liveN, $(if ($manualN -gt 0) { ("; {0} running -NoLiveMigration VM(s) need a MANUAL shutdown first" -f $manualN) } else { '' }))
+    Write-Log ("2. Phase B: {0} running VM(s) need a Live Migration{1}. Verify any appliance or Linux VM (e.g. the Cloud VM) with a single test Live Migration before applying in bulk." -f $liveN, $(if ($manualN -gt 0) { ("; {0} running -NoLiveMigration VM(s) need a MANUAL shutdown first" -f $manualN) } else { '' }))
 } else {
     Write-Log "2. Phase B: no running VM needs moving after Phase A."
 }
-if ($offSkip.Count -gt 0) {
-    Write-Log ("3. {0} powered-off VM(s) skipped by design (alignment only matters under load): {1}." -f $offSkip.Count, (($offSkip | Sort-Object VM | ForEach-Object { $_.VM }) -join ', '))
-    Write-Log "   Re-run this script when they are running to align them."
+if ($offMove.Count -gt 0) {
+    Write-Log ("3. {0} powered-off VM(s) are quick-migrated to their CSV owner under -Balance (risk-free, no downtime, only where it does not worsen role spread): {1}." -f $offMove.Count, (($offMove | Sort-Object VM | ForEach-Object { $_.VM }) -join ', '))
 } else {
-    Write-Log "3. No powered-off VMs to skip."
+    Write-Log "3. No powered-off VMs need migrating."
 }
-Write-Log ("4. Anti-affinity is set for {0} spreadable role pair(s). {1} pool(s) exceed their site node count and cannot be fully separated - review those manually (consider spreading new instances or accepting the floor)." -f $aaPlan.Count, $pools.Count)
+if ($offHold.Count -gt 0) {
+    Write-Log ("   {0} off VM(s) held to protect role spread (align on a later run when running): {1}." -f $offHold.Count, (($offHold | Sort-Object VM | ForEach-Object { $_.VM }) -join ', '))
+}
+if ($aaToSetTotal -eq 0) {
+    Write-Log ("4. Anti-affinity already covers all {0} spreadable role group(s) - nothing to (re)apply. {1} pool(s) exceed their site node count and cannot be fully separated." -f $aaPlan.Count, $pools.Count)
+} else {
+    Write-Log ("4. Anti-affinity: {0} member(s) across {1} spreadable role group(s) still need the class set (the rest already have it). {2} pool(s) exceed their site node count and cannot be fully separated - review those manually." -f $aaToSetTotal, $aaPlan.Count, $pools.Count)
+}
 Write-Log "5. Run order: preview with -WhatIf first, confirm the plan, then apply with -Balance."
 Write-Log ''
 Write-Log ("   Preview (no changes) :  .\{0} -Balance -WhatIf" -f $scriptName) -Color Green
@@ -592,11 +802,12 @@ if ($Html) {
     if (-not $ownRows) { $ownRows = "<tr><td colspan='4'>CSV ownership already optimal</td></tr>" }
     $roleRows = ''
     foreach ($d in ($preColl.Detail | Sort-Object @{E={$_.Collisions};Descending=$true}, Role)) {
-        $cls = if ($d.Spreadable -and $d.Collisions -gt 0) { 'warn' } elseif (-not $d.Spreadable) { 'pool' } else { 'ok' }
+        $actionable = ($d.Spreadable -and $d.Collisions -gt 0) -or ((-not $d.Spreadable) -and $d.Imbalance -gt 0)
+        $cls = if ($actionable) { 'warn' } elseif (-not $d.Spreadable) { 'pool' } else { 'ok' }
         $roleRows += "<tr class='$cls'><td>$($d.Role)</td><td>$($d.Count)</td><td>$($d.Avail)</td><td>$($d.Collisions)</td><td>$($d.Layout)</td></tr>"
     }
     $html = @"
-<!doctype html><html><head><meta charset='utf-8'><title>VM Placement</title>
+<!doctype html><html><head><meta charset='utf-8'><title>$ClusterName VM Placement</title>
 <style>body{font-family:Calibri,Segoe UI,sans-serif;color:#3A4255;margin:24px}h1{color:#0A1024;margin:0}.cyan{color:#0A7E9E}
 h2{color:#0A1024;border-bottom:2px solid #D3D8E0;padding-bottom:4px;margin-top:26px}.sub{color:#6B7285;font-size:12px;margin:2px 0 18px}
 .cols{display:flex;gap:28px}.col{flex:1}table{border-collapse:collapse;width:100%;font-size:13px}td,th{padding:5px 7px;border:1px solid #E2E6EC;text-align:left}
@@ -604,7 +815,7 @@ th{background:#0A1024;color:#fff}td.n{font-weight:bold;color:#0A1024;width:90px}
 .bar.vm{background:#2E74B5}.bar.mem{background:#0A7E9E}td.al{color:#548235;font-weight:bold;text-align:center}td.mis{color:#C00000;font-weight:bold;text-align:center}
 tr.warn td{background:#FCEBDD}tr.pool td{background:#F2F2F2}.metric{font-size:13px;margin:8px 0}</style></head><body>
 <h1>Cloud<span class='cyan'>Labs</span></h1><div class='sub'>Decades of server expertise</div>
-<h1>VM Placement - Pre / Post</h1>
+<h1>$ClusterName VM Placement - Pre / Post</h1>
 <div class='sub'>Cluster $ClusterName &middot; $(Get-Date) &middot; mode: $(if($Balance){'BALANCE'}else{'ANALYSIS ONLY'})</div>
 <div class='metric'>Aligned: PRE $alignedNow &rarr; after CSV-owner $alignedPhaseA &rarr; POST $((($postDist.Values|Measure-Object Aligned -Sum).Sum)) / $($inScope.Count) &nbsp;|&nbsp; spreadable collisions PRE $($preColl.Total) &rarr; POST $($postColl.Total)</div>
 <h2>CSV-ownership rebalancing (Phase A)</h2><table><tr><th>CSV</th><th>From</th><th>To</th><th>Extra aligned</th></tr>$ownRows</table>
